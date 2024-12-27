@@ -12,7 +12,11 @@ cache_storage_t* cache_storage_init(unsigned int max_nodes) {
 	cache_storage->first = NULL;
 	cache_storage->last= NULL;
 	cache_storage->space_left = max_nodes;
-	cache_storage->sync = sync_init();
+	int err = pthread_mutex_init(&(cache_storage->mutex), NULL);
+	if (err) {
+		printf("cache_storage_init: pthread_mutex_init() failed: %s\n", strerror(errno));
+		return NULL;
+	}
 	return cache_storage;
 }
 
@@ -26,7 +30,7 @@ void cache_storage_destroy(cache_storage_t* cache_storage) {
 		cache_node_destroy(current_node);
 		current_node = temp;
 	}
-	sync_destroy(cache_storage->sync);
+	pthread_mutex_destroy(&(cache_storage->mutex));
 	free(cache_storage);
 }
 
@@ -49,12 +53,19 @@ cache_node_t* cache_node_init(char* key, /*Nullable*/ cache_block_t* block) {
 	}
 	strcpy(cache_node->key, key);
 	cache_node->block = block;
-	cache_node->sync = sync_init();
-	if (cache_node->sync == NULL) {
-		printf("cache_node_init: sync_init() failed: %s\n", strerror(errno));
+	int err = pthread_mutex_init(&(cache_node->mutex), NULL);
+	if (err) {
+		printf("cache_node_init: pthread_mutex_init() failed: %s\n", strerror(errno));
 		free(cache_node);
 		return NULL;
 	}
+	err = pthread_cond_init(&(cache_node->someone_finished_using), NULL);
+	if (err) {
+		printf("cache_node_init: pthread_cond_init() failed: %s\n", strerror(errno));
+		free(cache_node);
+		return NULL;
+	}
+	cache_node->marked_for_deletion = 0;
 	return cache_node;
 }
 
@@ -68,7 +79,8 @@ void cache_node_destroy(cache_node_t* cache_node) {
 		cache_block_destroy(current_block);
 		current_block = temp;
 	}
-	sync_destroy(cache_node->sync);
+	pthread_mutex_destroy(&(cache_node->mutex));
+	pthread_cond_destroy(&(cache_node->someone_finished_using));
 	free(cache_node);
 }
 
@@ -106,22 +118,16 @@ cache_node_t* cache_find_pop(/*Nullable*/ cache_storage_t* cache_storage, /*Null
 		return NULL;
 	}
 
-	sync_lock_w(cache_storage->sync);
-
 	cache_node_t* current_node = cache_storage->first;
 	while (current_node != NULL) {
 		if (strcmp(key, current_node->key) == 0) {
 			if (current_node->prev != NULL) {	// not first
-				sync_lock_w(current_node->prev->sync);
 				current_node->prev->next = current_node->next;
-				sync_unlock(current_node->prev->sync);
 			} else {				// first
 				cache_storage->first = current_node->next;
 			}
 			if (current_node->next != NULL) {	// not last
-				sync_lock_w(current_node->next->sync);
 				current_node->next->prev = current_node->prev;
-				sync_unlock(current_node->next->sync);
 			} else {				// last
 				cache_storage->last = current_node->prev;
 			}
@@ -129,16 +135,10 @@ cache_node_t* cache_find_pop(/*Nullable*/ cache_storage_t* cache_storage, /*Null
 			current_node->prev = NULL;
 			current_node->next = NULL;
 			cache_storage->space_left++;
-
-			sync_unlock(cache_storage->sync);
-
 			return current_node;
 		}
 		current_node = current_node->next;
 	}
-
-	sync_unlock(cache_storage->sync);
-
 	return NULL;
 }
 
@@ -155,10 +155,7 @@ int cache_add_most_recent(
 		return -1;
 	}
 
-	sync_lock_w(cache_storage->sync);
-
 	if (cache_storage->space_left == 0) {
-		sync_unlock(cache_storage->sync);
 		return -1;
 	}
 
@@ -168,9 +165,7 @@ int cache_add_most_recent(
 	cache_node->next = old_first;
 
 	if (old_first != NULL) {
-		sync_lock_w(old_first->sync);
 		old_first->prev = cache_node;
-		sync_unlock(old_first->sync);
 	}
 
 	if (cache_storage->last == NULL) {
@@ -178,7 +173,6 @@ int cache_add_most_recent(
 	}
 	cache_storage->space_left--;
 
-	sync_unlock(cache_storage->sync);
 	return 0;
 }
 /* Pops least used element (which is stored as last), if such exists.
@@ -190,29 +184,22 @@ cache_node_t* cache_pop_least_used(cache_storage_t* cache_storage) {
 		return NULL;
 	}
 
-	sync_lock_w(cache_storage->sync);
-
 	if (cache_storage->last == NULL) {
-		sync_unlock(cache_storage->sync);
 		return NULL;
 	}
+
 	cache_node_t* old_last = cache_storage->last;
 	cache_storage->last = old_last->prev;
 
-	sync_lock_w(old_last->sync);
 	old_last->prev = NULL;
 	old_last->next = NULL; // Should be NULL already, but lets ensure.
-	sync_unlock(old_last->sync);
 
-	sync_lock_w(cache_storage->last->sync);
 	cache_storage->last->next = NULL;
-	sync_unlock(cache_storage->last->sync);
 
 	if (cache_storage->first == old_last) { // If the element was alone in cache.
 		cache_storage->first = NULL;
 	}
 	cache_storage->space_left++;
-	sync_unlock(cache_storage->sync);
 	return old_last;
 }
 
@@ -225,5 +212,14 @@ void cache_destroy_least_used(cache_storage_t* cache_storage) {
 		printf("cache_destroy_least_used: cache_storage is NULL\n");
 		return;
 	}
-	cache_node_destroy(cache_pop_least_used(cache_storage));
+	cache_node_t* cache_node = cache_pop_least_used(cache_storage);
+
+	pthread_mutex_lock(&(cache_node->mutex));
+	cache_node->marked_for_deletion = 1;
+	while (cache_node->readers_amount > 0) {
+		pthread_cond_wait(&(cache_node->someone_finished_using), &(cache_node->mutex));
+	}
+	pthread_mutex_unlock(&(cache_node->mutex));
+
+	cache_node_destroy(cache_node);
 }

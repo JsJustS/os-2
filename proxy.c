@@ -121,47 +121,13 @@ void* proxy_serve_client(void* client_args) {
 	proxy_print(proxy_settings, "[%d] Parsed host: %s\n", gettid(), host);
 	proxy_print(proxy_settings, "[%d] Parsed port: %s\n", gettid(), port);
 
-	cache_node_t* cache_node = NULL;
-	if (strcmp(method, "GET") == 0) { // Только GET кешируем
-		cache_node = cache_find_pop(cache_storage, url);
-		proxy_print(
-			proxy_settings,
-			"[%d] Cachable method, cache node: %p, url: %s, space left: %d\n",
-			gettid(), cache_node, url,
-			(cache_node != NULL) ? cache_storage->space_left - 1 : cache_storage->space_left
-		);
-	}
-	if (cache_node != NULL) { // Нашли кеш (мб на время ещё проверить как-нибудь)
-		proxy_print(proxy_settings, "[%d] Cache hit!\n", gettid());
-		cache_add_most_recent(cache_storage, cache_node);
-		proxy_cache_send_partly(proxy_settings, client_socket_fd, cache_node->block);
-		__sync_fetch_and_sub(&number_of_threads, 1);
-		free(request);
-		free(method);
-		free(host);
-		free(path);
-		free(url);
-		close(client_socket_fd);
-		return NULL;
-	}
-
-	if (proxy_settings->cache_enabled && strcmp("GET", method) == 0) {
-		proxy_print(proxy_settings, "[%d] Cache miss.\n", gettid());
-	}
-
-	// Если не в кеше - идём на сервер и кешируем
-	struct addrinfo hints;
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-	struct addrinfo* server_infos;
-	err = getaddrinfo(host, port, &hints, &server_infos);
-	if (err) {
+	int server_socket_fd = proxy_try_for_server_socket(host, port);
+	if (server_socket_fd < 0) {
 		proxy_print(proxy_settings, "[%d] Could not get address info!\n", gettid());
 		if (err == EAI_SYSTEM) {
 			printf("proxy_serve_client: getaddrinfo() failed: %s\n", strerror(errno));
 		} else {
-			printf("proxy_serve_client: getaddrinfo() failed: %s\n", gai_strerror(err));
+			printf("proxy_serve_client: getaddrinfo() failed: %s\n", gai_strerror(server_socket_fd));
 		}
 		proxy_send_s(client_socket_fd, HTTP_STATUS_502);
 		__sync_fetch_and_sub(&number_of_threads, 1);
@@ -174,48 +140,28 @@ void* proxy_serve_client(void* client_args) {
 		return NULL;
 	}
 
-	struct addrinfo* current_server_info = server_infos;
-	int server_socket_fd;
-	while (current_server_info != NULL) {
-		server_socket_fd = socket(
-			current_server_info->ai_family,
-			current_server_info->ai_socktype,
-			current_server_info->ai_protocol
-		);
+	int should_request_be_cached = 	(proxy_settings->cache_enabled) &&
+					(cache_storage != NULL) &&
+					(strcmp(method, "GET") == 0);
 
-		if (server_socket_fd == -1) {
-			printf("proxy_serve_client: socket() failed: %s\n", strerror(errno));
-			proxy_send_s(client_socket_fd, HTTP_STATUS_500);
-			__sync_fetch_and_sub(&number_of_threads, 1);
-			free(request);
-			free(method);
-			free(host);
-			free(path);
-			free(url);
-			freeaddrinfo(server_infos);
-			close(client_socket_fd);
-			return NULL;
-		}
+	if (!should_request_be_cached) {
 
-		err = connect(
+		err = proxy_cache_request_and_send_partly(
+			proxy_settings,
 			server_socket_fd,
-			current_server_info->ai_addr,
-			current_server_info->ai_addrlen
+			client_socket_fd,
+			NULL,
+			NULL,
+			request,
+			request_length
 		);
-		if (err) {
-			printf("proxy_serve_client: connect() failed: %s\n", strerror(errno));
-			close(server_socket_fd);
-			current_server_info = current_server_info->ai_next;
-			continue;
-		}
-		break;
-	}
-	freeaddrinfo(server_infos);
 
-	// Вышли из цикла, так и не найдя рабочий адрес
-	if (current_server_info == NULL) {
-		proxy_print(proxy_settings, "[%d] Could not find working address!\n", gettid());
-		proxy_send_s(client_socket_fd, HTTP_STATUS_500);
+		if (err) {
+			printf("proxy_serve_client: proxy_cache_request_and_send_partly() failed\n");
+		} else {
+			proxy_print(proxy_settings, "[%d] Successfuly worked with %s\n", gettid(), url);
+		}
+
 		__sync_fetch_and_sub(&number_of_threads, 1);
 		free(request);
 		free(method);
@@ -226,11 +172,56 @@ void* proxy_serve_client(void* client_args) {
 		return NULL;
 	}
 
+	proxy_print(proxy_settings, "[%d] LOCKING CACHE_STORAGE MUTEX...\n", gettid());
+	pthread_mutex_lock(&(cache_storage->mutex));
+	proxy_print(proxy_settings, "[%d] OBTAINED CACHE_STORAGE MUTEX\n", gettid());
+
+	cache_node_t* cache_node = cache_find_pop(cache_storage, url);
+	if (cache_node != NULL) {
+		cache_add_most_recent(cache_storage, cache_node);
+
+		pthread_mutex_unlock(&(cache_storage->mutex));
+		proxy_print(proxy_settings, "[%d] UNLOCKED CACHE_STORAGE MUTEX...\n", gettid());
+
+		if (!cache_node->marked_for_deletion) {
+			proxy_print(proxy_settings, "[%d] Cache hit!\n", gettid());
+
+			proxy_print(proxy_settings, "[%d] LOCKING CACHE_NODE MUTEX...\n", gettid());
+			pthread_mutex_lock(&(cache_node->mutex));
+			proxy_print(proxy_settings, "[%d] OBTAINED CACHE_NODE MUTEX\n", gettid());
+			cache_node->readers_amount++;
+			pthread_mutex_unlock(&(cache_node->mutex));
+			proxy_print(proxy_settings, "[%d] UNLOCKED CACHE_NODE MUTEX...\n", gettid());
+
+			proxy_cache_send_partly(proxy_settings, client_socket_fd, cache_node->block);
+
+			proxy_print(proxy_settings, "[%d] LOCKING CACHE_NODE MUTEX...\n", gettid());
+			pthread_mutex_lock(&(cache_node->mutex));
+			proxy_print(proxy_settings, "[%d] OBTAINED CACHE_NODE MUTEX\n", gettid());
+			cache_node->readers_amount--;
+			pthread_cond_signal(&(cache_node->someone_finished_using));
+			pthread_mutex_unlock(&(cache_node->mutex));
+			proxy_print(proxy_settings, "[%d] UNLOCKED CACHE_NODE MUTEX...\n", gettid());
+
+			__sync_fetch_and_sub(&number_of_threads, 1);
+			free(request);
+			free(method);
+			free(host);
+			free(path);
+			free(url);
+			close(client_socket_fd);
+			return NULL;
+		}
+	}
+
+	proxy_print(proxy_settings, "[%d] Cache miss.\n", gettid());
+
 	struct timeval timeout;
-	timeout.tv_sec = 2;  // 2 секунд
+	timeout.tv_sec = 60;
 	timeout.tv_usec = 0;
 
-	if (setsockopt(server_socket_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout)) < 0) {
+	err = setsockopt(server_socket_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+	if (err) {
         	printf("proxy_serve_client: setsockopt() failed: %s\n", strerror(errno));
 		proxy_send_s(client_socket_fd, HTTP_STATUS_500);
 		__sync_fetch_and_sub(&number_of_threads, 1);
@@ -241,6 +232,8 @@ void* proxy_serve_client(void* client_args) {
 		free(url);
 		close(client_socket_fd);
 		close(server_socket_fd);
+		pthread_mutex_unlock(&(cache_storage->mutex));
+		proxy_print(proxy_settings, "[%d] UNLOCKED CACHE_STORAGE MUTEX...\n", gettid());
 		return NULL;
 	}
 
@@ -248,17 +241,19 @@ void* proxy_serve_client(void* client_args) {
 		proxy_settings,
 		server_socket_fd,
 		client_socket_fd,
-		((strcmp("GET", method) == 0) ? cache_storage : NULL),
+		cache_storage,
 		url,
 		request,
 		request_length
 	);
+
+	pthread_mutex_unlock(&(cache_storage->mutex));
+	proxy_print(proxy_settings, "[%d] UNLOCKED CACHE_STORAGE MUTEX...\n", gettid());
+
 	if (err) {
 		printf("proxy_serve_client: proxy_cache_request_and_send_partly() failed\n");
-	} else if (strcmp("GET", method) == 0) { // Кешировали
-		proxy_print(proxy_settings, "[%d] Successfuly cached %s\n", gettid(), url);
 	} else {
-		proxy_print(proxy_settings, "[%d] Successfuly worked with %s\n", gettid(), url);
+		proxy_print(proxy_settings, "[%d] Successfuly cached %s\n", gettid(), url);
 	}
 
 	__sync_fetch_and_sub(&number_of_threads, 1);
@@ -283,18 +278,18 @@ void proxy_start(proxy_settings_t* proxy_settings) {
 	}
 
 	// Создание серверного сокета
-	int server_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (server_socket_fd < 0) {
+	int proxy_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (proxy_socket_fd < 0) {
 		printf("proxy_start: socket() failed: %s\n", strerror(errno));
 		abort();
 	}
 
 	// Настройка серверного сокета
 	int option = 1;
-	err = setsockopt(server_socket_fd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
+	err = setsockopt(proxy_socket_fd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
 	if (err) {
 		printf("proxy_start: socket() failed: %s\n", strerror(errno));
-		close(server_socket_fd);
+		close(proxy_socket_fd);
 		abort();
 	}
 
@@ -305,18 +300,18 @@ void proxy_start(proxy_settings_t* proxy_settings) {
 	sin.sin_port = htons(proxy_settings->port);
 
 	// Присвоение сокету выданного адреса с указанным портом
-	err = bind(server_socket_fd, (struct sockaddr *) &sin, sizeof(sin));
+	err = bind(proxy_socket_fd, (struct sockaddr *) &sin, sizeof(sin));
 	if (err) {
 		printf("proxy_start: bind() failed: %s\n", strerror(errno));
-		close(server_socket_fd);
+		close(proxy_socket_fd);
 		abort();
 	}
 
 	// Запускаем прослушивание серверным сокетом на новые подключения
-	err = listen(server_socket_fd, proxy_settings->queue_len);
+	err = listen(proxy_socket_fd, proxy_settings->queue_len);
 	if (err) {
 		printf("proxy_start: listen() failed: %s\n", strerror(errno));
-		close(server_socket_fd);
+		close(proxy_socket_fd);
 		abort();
 	}
 
@@ -332,7 +327,7 @@ void proxy_start(proxy_settings_t* proxy_settings) {
 		cache_storage = cache_storage_init(proxy_settings->max_cache_nodes);
 		if (cache_storage == NULL) {
 			printf("proxy_start: cache_storage_init() failed: %s\n", strerror(errno));
-			close(server_socket_fd);
+			close(proxy_socket_fd);
 			abort();
 		}
 	}
@@ -341,14 +336,14 @@ void proxy_start(proxy_settings_t* proxy_settings) {
 	while (1) {
 		if (number_of_threads < proxy_settings->max_number_of_threads) {
 			int client_socket_fd = accept(
-				server_socket_fd,
+				proxy_socket_fd,
 				(struct sockaddr *)&sin,
 				&socket_length
 			);
 
 			if (client_socket_fd < 0) {
 				printf("proxy_start: accept() failed: %s\n", strerror(errno));
-				close(server_socket_fd);
+				close(proxy_socket_fd);
 				abort();
 			}
 
@@ -356,7 +351,7 @@ void proxy_start(proxy_settings_t* proxy_settings) {
 			proxy_client_arguments_t* client_args = malloc(sizeof(proxy_client_arguments_t));
 			if (client_args == NULL) {
 				printf("proxy_start: malloc() failed: %s\n", strerror(errno));
-				close(server_socket_fd);
+				close(proxy_socket_fd);
 				close(client_socket_fd);
 				abort();
 			}
@@ -696,14 +691,14 @@ int proxy_cache_request_and_send_partly(
         char* request,
         int request_length
 ) {
-	char* con = "\nConnection: close";
+	/*char* con = "\nConnection: close";
 	char request_x[strlen(request) + strlen(con) + 1];
 	int len = (int)(strstr(request, "\r\n\r\n") - request);
 	strncpy(request_x, request, len);
 	request_x[len] = '\0';
 	strcat(request_x, con);
 	strcat(request_x, request + len);
-	//printf("%s\n", request_x);
+	printf("%s\n", request_x);*/
 	int err = proxy_send(server_socket_fd, request, request_length);
 	if (err) {
 		printf("proxy_cache_request_and_send_partly: proxy_send() failed\n");
@@ -731,7 +726,7 @@ int proxy_cache_request_and_send_partly(
 		total += received;
 
 		// Шаг 1. Отправить юзеру кусок ответа.
-		puts("Step 1.");
+		//puts("Step 1.");
 		err = proxy_send(client_socket_fd, buffer, received);
 		if (err) {
 			// Не смогли отправить (соединение упало)
@@ -745,7 +740,7 @@ int proxy_cache_request_and_send_partly(
 		}
 
 		// Шаг 2. Превращаем кусок ответа в кэш
-		puts("Step 2.");
+		//puts("Step 2.");
 		if (cache_storage != NULL && url != NULL) {
 			cache_block_t* new_cache_block = cache_block_init(received);
 			if (new_cache_block == NULL) {
@@ -764,12 +759,12 @@ int proxy_cache_request_and_send_partly(
 		}
 
 		// Шаг 3. Повторить
-		puts("Step 3.");
+		//puts("Step 3.");
 //		received = read(server_socket_fd, buffer, proxy_settings->max_cache_block_size);
 		received = recv(server_socket_fd, buffer, proxy_settings->max_cache_block_size, 0);
 	}
 
-	if (received == -1 && (errno != EAGAIN)) {
+	if (received == -1) {
 		printf("proxy_cache_request_and_send_partly: recv() failed: %s\n", strerror(errno));
 		free(buffer);
 		if (cache_storage == NULL || url == NULL) {
@@ -803,4 +798,52 @@ int proxy_cache_request_and_send_partly(
 
 	free(buffer);
 	return 0;
+}
+
+int proxy_try_for_server_socket(char* host, char* port) {
+	struct addrinfo hints;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	struct addrinfo* server_infos;
+	int err = getaddrinfo(host, port, &hints, &server_infos);
+	if (err) {
+		return err;
+	}
+
+	struct addrinfo* current_server_info = server_infos;
+	int server_socket_fd;
+	while (current_server_info != NULL) {
+		server_socket_fd = socket(
+			current_server_info->ai_family,
+			current_server_info->ai_socktype,
+			current_server_info->ai_protocol
+		);
+
+		if (server_socket_fd == -1) {
+			printf("proxy_serve_client: socket() failed: %s\n", strerror(errno));
+			return -1;
+		}
+
+		err = connect(
+			server_socket_fd,
+			current_server_info->ai_addr,
+			current_server_info->ai_addrlen
+		);
+		if (err) {
+			printf("proxy_serve_client: connect() failed: %s\n", strerror(errno));
+			close(server_socket_fd);
+			current_server_info = current_server_info->ai_next;
+			continue;
+		}
+		break;
+	}
+	freeaddrinfo(server_infos);
+
+	// Вышли из цикла, так и не найдя рабочий адрес
+	if (current_server_info == NULL) {
+		return -1;
+	}
+
+	return server_socket_fd;
 }

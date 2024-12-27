@@ -1,7 +1,7 @@
 #ifndef __FIT_OS_CACHE_ROZHKOV_22202__
 #define __FIT_OS_CACHE_ROZHKOV_22202__
 
-#include "sync.h"
+#include <pthread.h>
 
 typedef struct _cache_block_t {
 	struct _cache_block_t* next;
@@ -14,14 +14,17 @@ typedef struct _cache_node_t {
 	struct _cache_node_t* prev;
 	char* key;
 	cache_block_t* block;
-	sync_t* sync;
+	pthread_mutex_t mutex;
+	pthread_cond_t someone_finished_using;
+	int readers_amount;
+	int marked_for_deletion;
 } cache_node_t;
 
 typedef struct _cache_storage_t {
 	cache_node_t* first;
 	cache_node_t* last;
 	unsigned int space_left;
-	sync_t* sync;
+	pthread_mutex_t mutex;
 } cache_storage_t;
 
 cache_storage_t* cache_storage_init(unsigned int max_nodes);

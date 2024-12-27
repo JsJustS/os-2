@@ -70,4 +70,6 @@ char* proxy_parse_port(char* host);
 int proxy_is_method_supported(char* method);
 int proxy_is_version_supported(char* buffer, int length);
 
+int proxy_try_for_server_socket(char* host, char* port);
+
 #endif		// __FIT_OS_PROXY_ROZHKOV_22202__
