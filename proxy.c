@@ -12,11 +12,12 @@
 #include <sys/types.h>
 #include <netdb.h>
 #include <fcntl.h>
+#include <limits.h>
 
 #include <sys/syscall.h>
 #define gettid() syscall(SYS_gettid)
 
-// GLOBAL VARIABLES
+// GLOBAL VARIABLES 
 int number_of_threads = 0;
 
 void proxy_print(proxy_settings_t* proxy_settings, const char* format, ...) {
@@ -717,13 +718,12 @@ int proxy_cache_request_and_send_partly(
 		cache_node = cache_node_init(url, NULL);
 	}
 
-	int total = 0;
+	unsigned long expected = ULONG_MAX;
+	unsigned long total = 0;
 //	int received = read(server_socket_fd, buffer, proxy_settings->max_cache_block_size);
 	int received = recv(server_socket_fd, buffer, proxy_settings->max_cache_block_size, 0);
 	while (received && received != -1) {
 		proxy_print(proxy_settings, "[%d] Received from %d byte(s) from server.\n", gettid(), received);
-
-		total += received;
 
 		// Шаг 1. Отправить юзеру кусок ответа.
 		//puts("Step 1.");
@@ -760,8 +760,32 @@ int proxy_cache_request_and_send_partly(
 
 		// Шаг 3. Повторить
 		//puts("Step 3.");
+		printf("... total: %lu\n", total);
+		printf("... expected: %lu\n", expected);
+
+		total += (unsigned long)received;
+		if (expected == ULONG_MAX) {
+			expected = parse_content_length_if_present(buffer, received);
+			char buffer_terminated[received + 1];
+			buffer_terminated[received] = '\0';
+			memcpy(buffer_terminated, buffer, received);
+			char* terminator = strstr(buffer, "\r\n\r\n");
+			if (terminator != NULL) {
+				expected += total - (received - (int)(terminator - buffer + 4));
+			}
+		}
+
+		if (total >= expected) { // Как бы == должно быть но на всякий :)
+			break;
+		}
 //		received = read(server_socket_fd, buffer, proxy_settings->max_cache_block_size);
 		received = recv(server_socket_fd, buffer, proxy_settings->max_cache_block_size, 0);
+	}
+
+	cache_block_t* block = cache_node->block;
+	while (block != NULL) {
+		fwrite(block->data,sizeof(char),block->size,stdout);
+		block = block->next;
 	}
 
 	if (received == -1) {
@@ -846,4 +870,29 @@ int proxy_try_for_server_socket(char* host, char* port) {
 	}
 
 	return server_socket_fd;
+}
+
+unsigned long parse_content_length_if_present(char* headers, int headers_length) {
+	char* header = "Content-Length:";
+	char headers_terminated[headers_length + 1];
+	headers_terminated[headers_length] = '\0';
+	memcpy(headers_terminated, headers, headers_length);
+	headers = strstr(headers_terminated, header);
+	//printf("%s\n", headers_terminated);
+	if (headers == NULL) {
+		return ULONG_MAX;
+	}
+
+	headers += strlen(header);
+	for (; *headers < '0' || *headers > '9'; headers++) {}
+
+	int length_of_str = 0;
+	for (; '0' < *headers && *headers < '9'; headers++) {length_of_str++;}
+
+	headers -= length_of_str;
+	char length[length_of_str + 1];
+	length[length_of_str] = '\0';
+	memcpy(length, headers, length_of_str);
+
+	return strtoul(length, NULL, 10);
 }

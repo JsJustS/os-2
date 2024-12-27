@@ -71,5 +71,6 @@ int proxy_is_method_supported(char* method);
 int proxy_is_version_supported(char* buffer, int length);
 
 int proxy_try_for_server_socket(char* host, char* port);
+unsigned long parse_content_length_if_present(char* request, int request_length);
 
 #endif		// __FIT_OS_PROXY_ROZHKOV_22202__
