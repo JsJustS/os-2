@@ -1,4 +1,4 @@
-#include "proxy.h"
+ #include "proxy.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
@@ -17,7 +17,7 @@
 #include <sys/syscall.h>
 #define gettid() syscall(SYS_gettid)
 
-// GLOBAL VARIABLES 
+// GLOBAL VARIABLES
 int number_of_threads = 0;
 
 void proxy_print(proxy_settings_t* proxy_settings, const char* format, ...) {
@@ -603,7 +603,48 @@ char* proxy_parse_url(char* data, int length) {
 		url[j++] = data[i];
 	}
 	url[j] = '\0';
-	return url;
+
+	// Сейчас в url либо полная ссылка, либо только path.
+	char* header = "Host:";
+	char data_terminated[length + 1];
+	data_terminated[length] = '\0';
+	memcpy(data_terminated, data, length);
+	char* host_header = strstr(data, header);
+
+	// Хедер отсутствует, url полный
+	if (host_header == NULL) {
+		return url;
+	}
+	// Хедер присутствует, переименовывем переменную
+	char* url_without_protocol = strstr(url, "//");
+	if (url_without_protocol == NULL) {
+		url_without_protocol = url;
+	} else {
+		url_without_protocol += 2;
+	}
+
+	char* path = strstr(url_without_protocol, "/");
+	if (path == NULL) {
+		puts("///////");
+		path = "/"; // index
+	}
+
+	char* host = host_header + strlen(header);
+	// скипаем вайтспейсы
+	for (; *host == ' ' || *host == '\n' || *host == '\r'; host++) {}
+	int host_length = 0;
+	for (; *host != ' ' && *host != '\n' && *host != '\r'; host++) {host_length++;}
+	char* modified_url = (char*)malloc(sizeof(char) * (7 + host_length + strlen(path) + 1));
+	host -= host_length;
+
+	memset(modified_url, '0', 7 + host_length + strlen(path) + 1);
+	memcpy(modified_url, "http://", 7);
+	memcpy(modified_url + 7, host, host_length);
+	memcpy(modified_url + 7 + host_length, path, strlen(path));
+	modified_url[7 + host_length + strlen(path)] = '\0';
+
+	free(url);
+	return modified_url;
 }
 
 int proxy_split_url(char* url, char** host_ptr, char** path_ptr) {
@@ -758,11 +799,8 @@ int proxy_cache_request_and_send_partly(
 			current_cache_block = new_cache_block;
 		}
 
-		// Шаг 3. Повторить
+		// Шаг 3. Проверяем количество прочитанных данных
 		//puts("Step 3.");
-		printf("... total: %lu\n", total);
-		printf("... expected: %lu\n", expected);
-
 		total += (unsigned long)received;
 		if (expected == ULONG_MAX) {
 			expected = parse_content_length_if_present(buffer, received);
@@ -775,18 +813,23 @@ int proxy_cache_request_and_send_partly(
 			}
 		}
 
+		//printf("... total: %lu\n", total);
+		//printf("... expected: %lu\n", expected);
+
 		if (total >= expected) { // Как бы == должно быть но на всякий :)
 			break;
 		}
+
+		// Шаг 4. Повторяем
 //		received = read(server_socket_fd, buffer, proxy_settings->max_cache_block_size);
 		received = recv(server_socket_fd, buffer, proxy_settings->max_cache_block_size, 0);
 	}
 
-	cache_block_t* block = cache_node->block;
+	/*cache_block_t* block = cache_node->block;
 	while (block != NULL) {
 		fwrite(block->data,sizeof(char),block->size,stdout);
 		block = block->next;
-	}
+	}*/
 
 	if (received == -1) {
 		printf("proxy_cache_request_and_send_partly: recv() failed: %s\n", strerror(errno));
@@ -887,7 +930,7 @@ unsigned long parse_content_length_if_present(char* headers, int headers_length)
 	for (; *headers < '0' || *headers > '9'; headers++) {}
 
 	int length_of_str = 0;
-	for (; '0' < *headers && *headers < '9'; headers++) {length_of_str++;}
+	for (; '0' <= *headers && *headers <= '9'; headers++) {length_of_str++;}
 
 	headers -= length_of_str;
 	char length[length_of_str + 1];
