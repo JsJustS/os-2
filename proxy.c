@@ -789,11 +789,12 @@ int proxy_cache_request_and_send_partly(
 		return -1;
 	}
 
-	char* buffer = (char*) malloc(sizeof(char) * (proxy_settings->max_cache_block_size));
-	if (buffer == NULL) {
+	char* full_buffer = (char*) malloc(sizeof(char) * (proxy_settings->max_cache_block_size) * 2);
+	if (full_buffer == NULL) {
 		printf("proxy_cache_request_and_send_partly: malloc() failed: %s\n", strerror(errno));
 		return -1;
 	}
+	char* buffer = full_buffer + proxy_settings->max_cache_block_size;
 
 	cache_block_t* current_cache_block = NULL;
 
@@ -801,6 +802,7 @@ int proxy_cache_request_and_send_partly(
 	unsigned long total = 0;
 //	int received = read(server_socket_fd, buffer, proxy_settings->max_cache_block_size);
 	int received = recv(server_socket_fd, buffer, proxy_settings->max_cache_block_size, 0);
+	int received_prev = 0;
 	while (received && received != -1) {
 		//proxy_print(proxy_settings, "[%d] Received from %d byte(s) from server.\n", gettid(), received);
 
@@ -810,7 +812,7 @@ int proxy_cache_request_and_send_partly(
 		if (err) {
 			// Не смогли отправить (соединение упало)
 			printf("proxy_cache_request_and_send_partly: proxy_send() failed\n");
-			free(buffer);
+			free(full_buffer);
 			return -1;
 		}
 
@@ -820,7 +822,7 @@ int proxy_cache_request_and_send_partly(
 			cache_block_t* new_cache_block = cache_block_init(received);
 			if (new_cache_block == NULL) {
 				printf("proxy_cache_request_and_send_partly: cache_block_init() failed\n");
-				free(buffer);
+				free(full_buffer);
 				return -1;
 			}
 			memcpy(new_cache_block->data, buffer, received);
@@ -842,14 +844,16 @@ int proxy_cache_request_and_send_partly(
 		//puts("Step 3.");
 		total += (unsigned long)received;
 		if (expected == ULONG_MAX) {
-			expected = parse_content_length_if_present(buffer, received);
-			char buffer_terminated[received + 1];
-			buffer_terminated[received] = '\0';
-			memcpy(buffer_terminated, buffer, received);
+			memcpy(full_buffer + received_prev, buffer, received);
+			expected = parse_content_length_if_present(full_buffer, received + received_prev);
+			char buffer_terminated[received_prev + received + 1];
+			buffer_terminated[received + received_prev] = '\0';
+			memcpy(buffer_terminated, full_buffer, received + received_prev);
 			char* terminator = strstr(buffer, "\r\n\r\n");
 			if (terminator != NULL) {
 				expected += total - (received - (int)(terminator - buffer + 4));
 			}
+			memcpy(full_buffer, full_buffer + received_prev, received);
 		}
 
 		//printf("... total: %lu\n", total);
@@ -861,6 +865,7 @@ int proxy_cache_request_and_send_partly(
 
 		// Шаг 4. Повторяем
 //		received = read(server_socket_fd, buffer, proxy_settings->max_cache_block_size);
+		received_prev = received;
 		received = recv(server_socket_fd, buffer, proxy_settings->max_cache_block_size, 0);
 	}
 
@@ -872,7 +877,7 @@ int proxy_cache_request_and_send_partly(
 
 	if (received == -1) {
 		printf("proxy_cache_request_and_send_partly: recv() failed: %s\n", strerror(errno));
-		free(buffer);
+		free(full_buffer);
 		return -1;
 	}
 
@@ -883,7 +888,7 @@ int proxy_cache_request_and_send_partly(
 		pthread_mutex_unlock(&(current_cache_block->mutex));
 	}
 
-	free(buffer);
+	free(full_buffer);
 	return 0;
 }
 
