@@ -65,6 +65,12 @@ cache_node_t* cache_node_init(char* key, /*Nullable*/ cache_block_t* block) {
 		free(cache_node);
 		return NULL;
 	}
+	err = pthread_cond_init(&(cache_node->updated_block), NULL);
+	if (err) {
+		printf("cache_node_init: pthread_cond_init() failed: %s\n", strerror(errno));
+		free(cache_node);
+		return NULL;
+	}
 	cache_node->marked_for_deletion = 0;
 	return cache_node;
 }
@@ -73,6 +79,15 @@ void cache_node_destroy(cache_node_t* cache_node) {
 	if (cache_node == NULL) {
 		return;
 	}
+
+	// Ensure thread safety
+	pthread_mutex_lock(&(cache_node->mutex));
+	cache_node->marked_for_deletion = 1;
+	while (cache_node->readers_amount > 0) {
+		pthread_cond_wait(&(cache_node->someone_finished_using), &(cache_node->mutex));
+	}
+	pthread_mutex_unlock(&(cache_node->mutex));
+
 	cache_block_t* current_block = cache_node->block;
 	while (current_block != NULL) {
 		cache_block_t* temp = current_block->next;
@@ -81,6 +96,7 @@ void cache_node_destroy(cache_node_t* cache_node) {
 	}
 	pthread_mutex_destroy(&(cache_node->mutex));
 	pthread_cond_destroy(&(cache_node->someone_finished_using));
+	pthread_cond_destroy(&(cache_node->updated_block));
 	free(cache_node);
 }
 
@@ -98,6 +114,19 @@ cache_block_t* cache_block_init(int size) {
 		return NULL;
 	}
 	cache_block->size = size;
+	int err = pthread_mutex_init(&(cache_block->mutex), NULL);
+	if (err) {
+		printf("cache_block_init: pthread_mutex_init() failed: %s\n", strerror(errno));
+		free(cache_block);
+		return NULL;
+	}
+	err = pthread_cond_init(&(cache_block->updated), NULL);
+	if (err) {
+		printf("cache_block_init: pthread_cond_init() failed: %s\n", strerror(errno));
+		free(cache_block);
+		return NULL;
+	}
+	cache_block->last = 0;
 	return cache_block;
 }
 
@@ -105,6 +134,8 @@ void cache_block_destroy(cache_block_t* cache_block) {
 	if (cache_block == NULL) {
 		return;
 	}
+	pthread_mutex_destroy(&(cache_block->mutex));
+	pthread_cond_destroy(&(cache_block->updated));
 	free(cache_block->data);
 	free(cache_block);
 }
@@ -213,13 +244,6 @@ void cache_destroy_least_used(cache_storage_t* cache_storage) {
 		return;
 	}
 	cache_node_t* cache_node = cache_pop_least_used(cache_storage);
-
-	pthread_mutex_lock(&(cache_node->mutex));
-	cache_node->marked_for_deletion = 1;
-	while (cache_node->readers_amount > 0) {
-		pthread_cond_wait(&(cache_node->someone_finished_using), &(cache_node->mutex));
-	}
-	pthread_mutex_unlock(&(cache_node->mutex));
 
 	cache_node_destroy(cache_node);
 }

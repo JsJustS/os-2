@@ -7,6 +7,9 @@ typedef struct _cache_block_t {
 	struct _cache_block_t* next;
 	char* data;
 	int size;
+	int last;
+	pthread_mutex_t mutex;
+	pthread_cond_t updated;
 } cache_block_t;
 
 typedef struct _cache_node_t {
@@ -15,6 +18,7 @@ typedef struct _cache_node_t {
 	char* key;
 	cache_block_t* block;
 	pthread_mutex_t mutex;
+	pthread_cond_t updated_block;
 	pthread_cond_t someone_finished_using;
 	int readers_amount;
 	int marked_for_deletion;

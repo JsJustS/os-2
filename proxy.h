@@ -46,14 +46,13 @@ int proxy_send(int socket_fd, char* data, int length);
 int proxy_cache_send_partly(
 	proxy_settings_t* proxy_settings,
 	int socket_fd,
-	cache_block_t* cache_block
+	cache_node_t* cache_node
 );
 int proxy_cache_request_and_send_partly(
 	proxy_settings_t* proxy_settings,
 	int server_socket_fd,
 	int client_socket_fd,
-	cache_storage_t* cache_storage,	/*Nullable*/
-	char* url, 			/*Nullable*/
+	cache_node_t* cache_node,	/*Nullable*/
 	char* request,
 	int request_length
 );
