@@ -35,6 +35,15 @@ typedef struct _proxy_client_arguments_t {
 	cache_storage_t* cache_storage;
 } proxy_client_arguments_t;
 
+typedef struct _proxy_cache_request_arguments_t {
+	proxy_settings_t* proxy_settings;
+	int server_socket_fd;
+	cache_node_t* cache_node;
+	cache_storage_t* cache_storage;
+	char* request;
+	int request_length;
+} proxy_cache_request_arguments_t;
+
 void proxy_settings_init(proxy_settings_t* proxy_settings);
 
 void proxy_start(proxy_settings_t* proxy_settings);
@@ -48,14 +57,8 @@ int proxy_cache_send_partly(
 	int socket_fd,
 	cache_node_t* cache_node
 );
-int proxy_cache_request_and_send_partly(
-	proxy_settings_t* proxy_settings,
-	int server_socket_fd,
-	int client_socket_fd,
-	cache_node_t* cache_node,	/*Nullable*/
-	char* request,
-	int request_length
-);
+
+void* proxy_cache_request(void* args);
 
 int proxy_recv(int socket_fd, char** buffer, proxy_settings_t* proxy_settings);
 

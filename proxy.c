@@ -147,10 +147,9 @@ void* proxy_serve_client(void* client_args) {
 
 	if (!should_request_be_cached) {
 
-		err = proxy_cache_request_and_send_partly(
+		/*err = proxy_cache_request(
 			proxy_settings,
 			server_socket_fd,
-			client_socket_fd,
 			NULL,
 			request,
 			request_length
@@ -160,7 +159,7 @@ void* proxy_serve_client(void* client_args) {
 			printf("proxy_serve_client: proxy_cache_request_and_send_partly() failed\n");
 		} else {
 			proxy_print(proxy_settings, "[%d] Successfuly worked with %s\n", gettid(), url);
-		}
+		}*/
 
 		__sync_fetch_and_sub(&number_of_threads, 1);
 		free(request);
@@ -178,32 +177,20 @@ void* proxy_serve_client(void* client_args) {
 
 	cache_node_t* cache_node = cache_find_pop(cache_storage, url);
 
-	if (cache_node != NULL) {
-		cache_add_most_recent(cache_storage, cache_node);
+	if (cache_node == NULL || cache_node->marked_for_deletion) {
+		proxy_print(proxy_settings, "[%d] Cache miss.\n", gettid());
 
-		pthread_mutex_unlock(&(cache_storage->mutex));
-		proxy_print(proxy_settings, "[%d] UNLOCKED CACHE_STORAGE MUTEX...\n", gettid());
+		cache_node = cache_node_init(url, NULL);
 
-		if (!cache_node->marked_for_deletion) {
-			proxy_print(proxy_settings, "[%d] Cache hit!\n", gettid());
+		if (!cache_storage->space_left) {
+			cache_destroy_least_used(cache_storage);
+		}
 
-			proxy_print(proxy_settings, "[%d] LOCKING CACHE_NODE MUTEX...\n", gettid());
-			pthread_mutex_lock(&(cache_node->mutex));
-			proxy_print(proxy_settings, "[%d] OBTAINED CACHE_NODE MUTEX\n", gettid());
-			cache_node->readers_amount++;
-			pthread_mutex_unlock(&(cache_node->mutex));
-			proxy_print(proxy_settings, "[%d] UNLOCKED CACHE_NODE MUTEX...\n", gettid());
+		err = cache_add_most_recent(cache_storage, cache_node);
 
-			proxy_cache_send_partly(proxy_settings, client_socket_fd, cache_node);
-
-			proxy_print(proxy_settings, "[%d] LOCKING CACHE_NODE MUTEX...\n", gettid());
-			pthread_mutex_lock(&(cache_node->mutex));
-			proxy_print(proxy_settings, "[%d] OBTAINED CACHE_NODE MUTEX\n", gettid());
-			cache_node->readers_amount--;
-			pthread_cond_signal(&(cache_node->someone_finished_using));
-			pthread_mutex_unlock(&(cache_node->mutex));
-			proxy_print(proxy_settings, "[%d] UNLOCKED CACHE_NODE MUTEX...\n", gettid());
-
+		if (err) {
+			printf("proxy_serve_client: cache_add_most_recent() failed: %s\n", strerror(errno));
+			cache_node_destroy(cache_node);
 			__sync_fetch_and_sub(&number_of_threads, 1);
 			free(request);
 			free(method);
@@ -211,79 +198,108 @@ void* proxy_serve_client(void* client_args) {
 			free(path);
 			free(url);
 			close(client_socket_fd);
+
+			pthread_mutex_unlock(&(cache_storage->mutex));
+			proxy_print(proxy_settings, "[%d] UNLOCKED CACHE_STORAGE MUTEX...\n", gettid());
 			return NULL;
 		}
-	}
-
-
-	proxy_print(proxy_settings, "[%d] Cache miss.\n", gettid());
-
-	cache_node = cache_node_init(url, NULL);
-
-	if (!cache_storage->space_left) {
-		cache_destroy_least_used(cache_storage);
-	}
-
-	err = cache_add_most_recent(cache_storage, cache_node);
-
-	if (err) {
-		printf("proxy_cache_request_and_send_partly: cache_add_most_recent() failed: %s\n", strerror(errno));
-		cache_node_destroy(cache_node);
-		__sync_fetch_and_sub(&number_of_threads, 1);
-		free(request);
-		free(method);
-		free(host);
-		free(path);
-		free(url);
-		close(client_socket_fd);
 
 		pthread_mutex_unlock(&(cache_storage->mutex));
 		proxy_print(proxy_settings, "[%d] UNLOCKED CACHE_STORAGE MUTEX...\n", gettid());
-		return NULL;
-	}
 
-	pthread_mutex_unlock(&(cache_storage->mutex));
-	proxy_print(proxy_settings, "[%d] UNLOCKED CACHE_STORAGE MUTEX...\n", gettid());
+		struct timeval timeout;
+		timeout.tv_sec = 60;
+		timeout.tv_usec = 0;
 
-	struct timeval timeout;
-	timeout.tv_sec = 60;
-	timeout.tv_usec = 0;
+		err = setsockopt(server_socket_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+		if (err) {
+        		printf("proxy_serve_client: setsockopt() failed: %s\n", strerror(errno));
+			proxy_send_s(client_socket_fd, HTTP_STATUS_500);
+			__sync_fetch_and_sub(&number_of_threads, 1);
+			free(request);
+			free(method);
+			free(host);
+			free(path);
+			free(url);
+			close(client_socket_fd);
+			close(server_socket_fd);
+			pthread_mutex_unlock(&(cache_storage->mutex));
+			proxy_print(proxy_settings, "[%d] UNLOCKED CACHE_STORAGE MUTEX...\n", gettid());
+			return NULL;
+		}
 
-	err = setsockopt(server_socket_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-	if (err) {
-        	printf("proxy_serve_client: setsockopt() failed: %s\n", strerror(errno));
-		proxy_send_s(client_socket_fd, HTTP_STATUS_500);
-		__sync_fetch_and_sub(&number_of_threads, 1);
-		free(request);
-		free(method);
-		free(host);
-		free(path);
-		free(url);
-		close(client_socket_fd);
-		close(server_socket_fd);
-		pthread_mutex_unlock(&(cache_storage->mutex));
-		proxy_print(proxy_settings, "[%d] UNLOCKED CACHE_STORAGE MUTEX...\n", gettid());
-		return NULL;
-	}
+		pthread_attr_t thread_attribute;
+		pthread_attr_init(&thread_attribute);
+		pthread_attr_setdetachstate(&thread_attribute, PTHREAD_CREATE_DETACHED);
 
-	err = proxy_cache_request_and_send_partly(
-		proxy_settings,
-		server_socket_fd,
-		client_socket_fd,
-		cache_node,
-		request,
-		request_length
-	);
+		proxy_cache_request_arguments_t* args = malloc(sizeof(proxy_cache_request_arguments_t));
+		if (args == NULL) {
+			proxy_send_s(client_socket_fd, HTTP_STATUS_500);
+			__sync_fetch_and_sub(&number_of_threads, 1);
+			free(request);
+			free(method);
+			free(host);
+			free(path);
+			free(url);
+			close(client_socket_fd);
+			close(server_socket_fd);
+			pthread_mutex_unlock(&(cache_storage->mutex));
+			proxy_print(proxy_settings, "[%d] UNLOCKED CACHE_STORAGE MUTEX...\n", gettid());
+			return NULL;
+		}
 
-	if (err) {
-		printf("proxy_serve_client: proxy_cache_request_and_send_partly() failed\n");
-		pthread_mutex_lock(&(cache_storage->mutex));
-		cache_find_pop(cache_storage, cache_node->key);
-		cache_node_destroy(cache_node);
-		pthread_mutex_unlock(&(cache_storage->mutex));
+		args->proxy_settings = proxy_settings;
+		args->server_socket_fd = server_socket_fd;
+		args->cache_node = cache_node;
+		args->cache_storage = cache_storage;
+		args->request = request;
+		args->request_length = request_length;
+
+		pthread_t tid;
+		err = pthread_create(
+			&tid,
+			&thread_attribute,
+			proxy_cache_request,
+			(void*)args
+		);
+
+		if (err) {
+			proxy_send_s(client_socket_fd, HTTP_STATUS_500);
+			__sync_fetch_and_sub(&number_of_threads, 1);
+			free(request);
+			free(method);
+			free(host);
+			free(path);
+			free(url);
+			close(client_socket_fd);
+			close(server_socket_fd);
+			pthread_mutex_unlock(&(cache_storage->mutex));
+			proxy_print(proxy_settings, "[%d] UNLOCKED CACHE_STORAGE MUTEX...\n", gettid());
+			return NULL;
+		}
 	} else {
-		proxy_print(proxy_settings, "[%d] Successfuly cached %s\n", gettid(), url);
+		cache_add_most_recent(cache_storage, cache_node);
+		pthread_mutex_unlock(&(cache_storage->mutex));
+		proxy_print(proxy_settings, "[%d] UNLOCKED CACHE_STORAGE MUTEX...\n", gettid());
+		proxy_print(proxy_settings, "[%d] Cache hit!\n", gettid());
 	}
+
+	proxy_print(proxy_settings, "[%d] LOCKING CACHE_NODE MUTEX...\n", gettid());
+	pthread_mutex_lock(&(cache_node->mutex));
+	proxy_print(proxy_settings, "[%d] OBTAINED CACHE_NODE MUTEX\n", gettid());
+	cache_node->readers_amount++;
+	pthread_mutex_unlock(&(cache_node->mutex));
+	proxy_print(proxy_settings, "[%d] UNLOCKED CACHE_NODE MUTEX...\n", gettid());
+
+	proxy_cache_send_partly(proxy_settings, client_socket_fd, cache_node);
+
+	proxy_print(proxy_settings, "[%d] LOCKING CACHE_NODE MUTEX...\n", gettid());
+	pthread_mutex_lock(&(cache_node->mutex));
+	proxy_print(proxy_settings, "[%d] OBTAINED CACHE_NODE MUTEX\n", gettid());
+	cache_node->readers_amount--;
+	pthread_cond_signal(&(cache_node->someone_finished_using));
+	pthread_mutex_unlock(&(cache_node->mutex));
+	proxy_print(proxy_settings, "[%d] UNLOCKED CACHE_NODE MUTEX...\n", gettid());
 
 	__sync_fetch_and_sub(&number_of_threads, 1);
 	free(request);
@@ -775,24 +791,33 @@ int proxy_cache_send_partly(
 	return -1; /* Unreachable */
 }
 
-int proxy_cache_request_and_send_partly(
-        proxy_settings_t* proxy_settings,
-        int server_socket_fd,
-        int client_socket_fd,
-        cache_node_t* cache_node,	/*Nullable*/
-        char* request,
-        int request_length
-) {
+void* proxy_cache_request(void* args) {
+	proxy_settings_t* proxy_settings = ((proxy_cache_request_arguments_t*)args)->proxy_settings;
+	int server_socket_fd = ((proxy_cache_request_arguments_t*)args)->server_socket_fd;
+	cache_node_t* cache_node = ((proxy_cache_request_arguments_t*)args)->cache_node;
+	cache_storage_t* cache_storage = ((proxy_cache_request_arguments_t*)args)->cache_storage;
+	char* request = ((proxy_cache_request_arguments_t*)args)->request;
+	int request_length = ((proxy_cache_request_arguments_t*)args)->request_length;
+	free(args);
+
 	int err = proxy_send(server_socket_fd, request, request_length);
 	if (err) {
 		printf("proxy_cache_request_and_send_partly: proxy_send() failed\n");
-		return -1;
+		pthread_mutex_lock(&(cache_storage->mutex));
+		cache_find_pop(cache_storage, cache_node->key);
+		pthread_mutex_unlock(&(cache_storage->mutex));
+		cache_node_destroy(cache_node);
+		return NULL;
 	}
 
 	char* full_buffer = (char*) malloc(sizeof(char) * (proxy_settings->max_cache_block_size) * 2);
 	if (full_buffer == NULL) {
 		printf("proxy_cache_request_and_send_partly: malloc() failed: %s\n", strerror(errno));
-		return -1;
+		pthread_mutex_lock(&(cache_storage->mutex));
+		cache_find_pop(cache_storage, cache_node->key);
+		pthread_mutex_unlock(&(cache_storage->mutex));
+		cache_node_destroy(cache_node);
+		return NULL;
 	}
 	char* buffer = full_buffer + proxy_settings->max_cache_block_size;
 
@@ -800,30 +825,23 @@ int proxy_cache_request_and_send_partly(
 
 	unsigned long expected = ULONG_MAX;
 	unsigned long total = 0;
-//	int received = read(server_socket_fd, buffer, proxy_settings->max_cache_block_size);
 	int received = recv(server_socket_fd, buffer, proxy_settings->max_cache_block_size, 0);
 	int received_prev = 0;
 	while (received && received != -1) {
 		//proxy_print(proxy_settings, "[%d] Received from %d byte(s) from server.\n", gettid(), received);
 
-		// Шаг 1. Отправить юзеру кусок ответа.
+		// Шаг 1. Превращаем кусок ответа в кэш
 		//puts("Step 1.");
-		err = proxy_send(client_socket_fd, buffer, received);
-		if (err) {
-			// Не смогли отправить (соединение упало)
-			printf("proxy_cache_request_and_send_partly: proxy_send() failed\n");
-			free(full_buffer);
-			return -1;
-		}
-
-		// Шаг 2. Превращаем кусок ответа в кэш
-		//puts("Step 2.");
 		if (cache_node != NULL) {
 			cache_block_t* new_cache_block = cache_block_init(received);
 			if (new_cache_block == NULL) {
 				printf("proxy_cache_request_and_send_partly: cache_block_init() failed\n");
 				free(full_buffer);
-				return -1;
+				pthread_mutex_lock(&(cache_storage->mutex));
+				cache_find_pop(cache_storage, cache_node->key);
+				pthread_mutex_unlock(&(cache_storage->mutex));
+				cache_node_destroy(cache_node);
+				return NULL;
 			}
 			memcpy(new_cache_block->data, buffer, received);
 			if (current_cache_block == NULL) {
@@ -840,8 +858,8 @@ int proxy_cache_request_and_send_partly(
 			current_cache_block = new_cache_block;
 		}
 
-		// Шаг 3. Проверяем количество прочитанных данных
-		//puts("Step 3.");
+		// Шаг 2. Проверяем количество прочитанных данных
+		//puts("Step 2.");
 		total += (unsigned long)received;
 		if (expected == ULONG_MAX) {
 			memcpy(full_buffer + received_prev, buffer, received);
@@ -856,29 +874,23 @@ int proxy_cache_request_and_send_partly(
 			memcpy(full_buffer, full_buffer + received_prev, received);
 		}
 
-		//printf("... total: %lu\n", total);
-		//printf("... expected: %lu\n", expected);
-
 		if (total >= expected) { // Как бы == должно быть но на всякий :)
 			break;
 		}
 
-		// Шаг 4. Повторяем
-//		received = read(server_socket_fd, buffer, proxy_settings->max_cache_block_size);
+		// Шаг 3. Повторяем
 		received_prev = received;
 		received = recv(server_socket_fd, buffer, proxy_settings->max_cache_block_size, 0);
 	}
 
-	/*cache_block_t* block = cache_node->block;
-	while (block != NULL) {
-		fwrite(block->data,sizeof(char),block->size,stdout);
-		block = block->next;
-	}*/
-
 	if (received == -1) {
 		printf("proxy_cache_request_and_send_partly: recv() failed: %s\n", strerror(errno));
 		free(full_buffer);
-		return -1;
+		pthread_mutex_lock(&(cache_storage->mutex));
+		cache_find_pop(cache_storage, cache_node->key);
+		pthread_mutex_unlock(&(cache_storage->mutex));
+		cache_node_destroy(cache_node);
+		return NULL;
 	}
 
 	if (current_cache_block != NULL) {
@@ -889,7 +901,7 @@ int proxy_cache_request_and_send_partly(
 	}
 
 	free(full_buffer);
-	return 0;
+	return NULL;
 }
 
 int proxy_try_for_server_socket(char* host, char* port) {
